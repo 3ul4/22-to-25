@@ -1,27 +1,169 @@
-import { useState, useMemo, useRef, useEffect, Suspense, memo } from 'react';
+import { useState, useMemo, useRef, useEffect, Suspense, memo, forwardRef, useImperativeHandle } from 'react';
 import { Canvas, useFrame, extend, useThree } from '@react-three/fiber';
-import {
-  OrbitControls,
-  PerspectiveCamera,
-  shaderMaterial,
-  Float,
-  Stars,
-  Sparkles
-} from '@react-three/drei';
-import { Raycaster } from 'three';
-import { EffectComposer, Bloom, Vignette } from '@react-three/postprocessing';
 import * as THREE from 'three';
-import { MathUtils } from 'three';
+import { shaderMaterial, OrbitControls, PerspectiveCamera, Stars, Sparkles, Float } from '@react-three/drei';
+import { MathUtils, Raycaster } from 'three';
 import * as random from 'maath/random';
 import { GestureRecognizer, FilesetResolver, DrawingUtils } from "@mediapipe/tasks-vision";
+import { EffectComposer, Bloom, Vignette } from '@react-three/postprocessing';
+
+// --- Background Music Component ---
+const BackgroundMusic = forwardRef(function BackgroundMusic(props: any, ref: any) {
+  const { src = '/music1.mp3', fallbackUrl = 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3' } = props || {};
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [_isPlaying, setIsPlaying] = useState(false);
+  const [_muted, setMuted] = useState(true);
+  const [_loadedSrc, setLoadedSrc] = useState('');
+  const [_error, setError] = useState<string | null>(null);
+  const lastObjectUrlRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    const audio = new Audio();
+    audio.loop = true;
+    audio.preload = 'auto';
+    audio.crossOrigin = 'anonymous';
+    audio.muted = true; // start muted to satisfy autoplay
+    audioRef.current = audio;
+
+    const revokeLastObjectUrl = () => {
+      if (lastObjectUrlRef.current) {
+        try { URL.revokeObjectURL(lastObjectUrlRef.current); } catch (e) {}
+        lastObjectUrlRef.current = null;
+      }
+    };
+
+    const loadAsObjectUrl = async (url: string) => {
+      try {
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const blob = await resp.blob();
+        const obj = URL.createObjectURL(blob);
+        revokeLastObjectUrl();
+        lastObjectUrlRef.current = obj;
+        audio.src = obj;
+        setLoadedSrc(url);
+        return true;
+      } catch (e) {
+        return false;
+      }
+    };
+
+    const tryPlay = async () => {
+      try {
+        await audio.play();
+        if (!mounted) return true;
+        console.log('[BackgroundMusic] started (muted:', audio.muted, ') from', audio.src);
+        setIsPlaying(true);
+        setMuted(audio.muted ?? true);
+        setError(null);
+        return true;
+      } catch (e: any) {
+        console.warn('[BackgroundMusic] play() failed', e?.message || e);
+        return false;
+      }
+    };
+
+    (async () => {
+      // Try to fetch local source as blob (avoids CORS when served from same origin)
+      const ok = await loadAsObjectUrl(src);
+      if (ok) {
+        await tryPlay();
+        return;
+      }
+
+      // If local fetch failed, only attempt fallback if it can be fetched (CORS-safe)
+      const fbOk = await loadAsObjectUrl(fallbackUrl);
+      if (fbOk) {
+        await tryPlay();
+        return;
+      }
+
+      console.warn('[BackgroundMusic] no usable audio source found; ensure public/music.mp3 exists or provide a CORS-enabled fallback.');
+      setError('No audio source available (check public/music.mp3)');
+    })();
+
+    return () => {
+      mounted = false;
+      try { audio.pause(); audio.src = ''; } catch (e) {}
+      revokeLastObjectUrl();
+      audioRef.current = null;
+    };
+  }, [src, fallbackUrl]);
+
+  // expose imperative API to control playback (unmute/play)
+  useImperativeHandle(ref, () => ({
+    async unmute() {
+      try {
+        if (!audioRef.current) {
+          const a = new Audio();
+          a.loop = true; a.preload = 'auto'; a.crossOrigin = 'anonymous';
+          audioRef.current = a;
+        }
+        const audio = audioRef.current!;
+
+        const fetchToObjectUrl = async (url: string) => {
+          try {
+            const resp = await fetch(url);
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            const blob = await resp.blob();
+            const obj = URL.createObjectURL(blob);
+            if (lastObjectUrlRef.current) {
+              try { URL.revokeObjectURL(lastObjectUrlRef.current); } catch (e) {}
+            }
+            lastObjectUrlRef.current = obj;
+            audio.src = obj;
+            audio.load();
+            return true;
+          } catch (e) {
+            return false;
+          }
+        };
+
+        if (!audio.src || audio.src === '') {
+          let ok = await fetchToObjectUrl(src).catch(() => false);
+          if (!ok) ok = await fetchToObjectUrl(fallbackUrl).catch(() => false);
+        }
+
+        audio.muted = false;
+        try {
+          await audio.play();
+          setMuted(false);
+          setIsPlaying(true);
+          console.log('[BackgroundMusic] unmuted via imperative call');
+          return;
+        } catch (playErr: any) {
+          if (playErr && (playErr.name === 'NotSupportedError' || /no supported sources/i.test(String(playErr.message || '')))) {
+            console.warn('[BackgroundMusic] unmute attempt blocked NotSupportedError - trying fallback source', playErr);
+            try {
+              audio.pause();
+              audio.src = fallbackUrl;
+              audio.load();
+              await audio.play();
+              setMuted(false);
+              setIsPlaying(true);
+              console.log('[BackgroundMusic] unmuted with fallback source');
+              return;
+            } catch (fallbackErr) {
+              console.warn('[BackgroundMusic] fallback unmute failed', fallbackErr);
+            }
+          }
+          console.warn('[BackgroundMusic] unmute attempt blocked', playErr);
+        }
+      } catch (e) {
+        console.warn('[BackgroundMusic] unmute unexpected error', e);
+      }
+    }
+  }), [src, fallbackUrl]);
+
+  // Hidden component — playback handled automatically and via imperative unmute
+  return null;
+});
 
 // Load ALL available photos - generate paths for photos 1-92 plus the special one
-// This covers all numbered photos in the directory (1-78, 89-92)
 const MAX_PHOTO_NUMBER = 92;
 const bodyPhotoPaths = [
-  // Numbered photos 1-92 (missing ones will show placeholder)
   ...Array.from({ length: MAX_PHOTO_NUMBER }, (_, i) => `/photos/${i + 1}.jpg`),
-  // Special photo
   '/photos/427861847_305426262544486_5164544616489027935_n.jpg'
 ];
 
@@ -124,31 +266,196 @@ const getTreePosition = () => {
   return [r * Math.cos(theta), y, r * Math.sin(theta)];
 };
 
+// --- Helper: Galaxy Position (for stardust) ---
+const getGalaxyPosition = () => {
+  const arms = 3; // number of spiral arms
+  const maxR = 35; // galaxy radius for stardust
+  // radial distribution: more density near center
+  const r = Math.pow(Math.random(), 0.6) * maxR;
+  const arm = Math.floor(Math.random() * arms);
+  const baseAngle = (arm / arms) * Math.PI * 2;
+  const theta = baseAngle + r * 0.2 + (Math.random() - 0.5) * 0.8; // add noise
+  const z = (Math.random() - 0.5) * 8 * (r / maxR); // slight thickness
+  return [r * Math.cos(theta), z, r * Math.sin(theta)];
+};
+
+// --- Helper: Heart Position ---
+const getHeartPosition = () => {
+  // Parametric heart equation: https://mathworld.wolfram.com/HeartCurve.html
+  const t = Math.random() * Math.PI * 2;
+  const scale = 15 + Math.random() * 20; // Heart size
+  
+  // Heart parametric equations (simplified)
+  const x = scale * 16 * Math.pow(Math.sin(t), 3);
+  const y = scale * (13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t));
+  const z = (Math.random() - 0.5) * 5; // slight depth variation
+  
+  return [x * 0.05, y * 0.05, z];
+};
+
+// --- Helper: I LOVE YOU Text Position ---
+// Creates positions to form "I LOVE YOU" text in 3D space
+const getILoveYouPosition = (index: number, total: number) => {
+  // Define letter patterns for "I LOVE YOU" (simplified block letters)
+  // Each letter is represented as a grid of positions
+  const letterHeight = 12;
+  const letterSpacing = 12;
+  const scale = 0.8;
+  
+  // Calculate which letter and position within that letter
+  const letters = [
+    // "I"
+    [[0, 5], [1, 5], [2, 5], [3, 5], [4, 5], [5, 5], [6, 5], [7, 5], [3.5, 0], [3.5, 1], [3.5, 2], [3.5, 10], [3.5, 11], [0, 11], [1, 11], [2, 11], [3, 11], [4, 11], [5, 11], [6, 11], [7, 11]],
+    // " " (space between I and LOVE)
+    [],
+    // "L"
+    [[0, 0], [0, 1], [0, 2], [0, 3], [0, 4], [0, 5], [0, 6], [0, 7], [0, 8], [0, 9], [0, 10], [0, 11], [1, 11], [2, 11], [3, 11], [4, 11], [5, 11], [6, 11], [7, 11]],
+    // "O"
+    [[1, 2], [2, 1], [3, 1], [4, 1], [5, 1], [6, 2], [6, 3], [6, 4], [6, 5], [6, 6], [6, 7], [6, 8], [6, 9], [5, 10], [4, 10], [3, 10], [2, 10], [1, 9], [1, 8], [1, 7], [1, 6], [1, 5], [1, 4], [1, 3]],
+    // "V"
+    [[0, 0], [0, 1], [0, 2], [0, 3], [0, 4], [0, 5], [1, 6], [2, 7], [3, 8], [4, 9], [5, 10], [6, 11], [7, 10], [8, 9], [9, 8], [10, 7], [11, 6], [12, 5], [12, 4], [12, 3], [12, 2], [12, 1], [12, 0]],
+    // "E"
+    [[0, 0], [0, 1], [0, 2], [0, 3], [0, 4], [0, 5], [0, 6], [0, 7], [0, 8], [0, 9], [0, 10], [0, 11], [1, 0], [2, 0], [3, 0], [4, 0], [5, 0], [6, 0], [1, 5], [2, 5], [3, 5], [4, 5], [5, 5], [1, 11], [2, 11], [3, 11], [4, 11], [5, 11], [6, 11]],
+    // " " (space between LOVE and YOU)
+    [],
+    // "Y"
+    [[2, 0], [2, 1], [2, 2], [2, 3], [2, 4], [2, 5], [3, 6], [4, 7], [5, 8], [6, 9], [6, 10], [6, 11], [7, 8], [8, 7], [9, 6], [10, 5], [10, 4], [10, 3], [10, 2], [10, 1], [10, 0]],
+    // "O"
+    [[1, 2], [2, 1], [3, 1], [4, 1], [5, 1], [6, 2], [6, 3], [6, 4], [6, 5], [6, 6], [6, 7], [6, 8], [6, 9], [5, 10], [4, 10], [3, 10], [2, 10], [1, 9], [1, 8], [1, 7], [1, 6], [1, 5], [1, 4], [1, 3]],
+    // "U"
+    [[0, 0], [0, 1], [0, 2], [0, 3], [0, 4], [0, 5], [0, 6], [0, 7], [0, 8], [0, 9], [0, 10], [1, 11], [2, 11], [3, 11], [4, 11], [5, 11], [6, 11], [7, 10], [7, 9], [7, 8], [7, 7], [7, 6], [7, 5], [7, 4], [7, 3], [7, 2], [7, 1], [7, 0]]
+  ];
+  
+  // Calculate which letter we're in based on index distribution
+  const positionsPerLetter = Math.ceil(total / letters.reduce((sum, l) => sum + Math.max(l.length, 1), 0));
+  let accumulatedPositions = 0;
+  let currentLetterIndex = 0;
+  let positionInLetter = index;
+  
+  for (let i = 0; i < letters.length; i++) {
+    const letterPositions = Math.max(letters[i].length, 1) * positionsPerLetter;
+    if (index < accumulatedPositions + letterPositions) {
+      currentLetterIndex = i;
+      positionInLetter = index - accumulatedPositions;
+      break;
+    }
+    accumulatedPositions += letterPositions;
+  }
+  
+  const letter = letters[currentLetterIndex];
+  if (letter.length === 0) {
+    // Space - return random position
+    return [(Math.random() - 0.5) * 5, (Math.random() - 0.5) * 5, (Math.random() - 0.5) * 3];
+  }
+  
+  // Calculate position within letter
+  const positionInPattern = positionInLetter % letter.length;
+  const patternPos = letter[positionInPattern];
+  // Flip the X coordinate to fix the reversed text
+  const baseX = -(currentLetterIndex * letterSpacing - (letters.length * letterSpacing) / 2);
+  
+  // Add some randomness for organic look
+  const noiseX = (Math.random() - 0.5) * 0.5;
+  const noiseY = (Math.random() - 0.5) * 0.5;
+  const noiseZ = (Math.random() - 0.5) * 1.5;
+  
+  const x = (baseX - patternPos[0] * scale + noiseX) * 0.6;
+  const y = (patternPos[1] * scale - letterHeight * scale / 2 + noiseY) * 0.6;
+  const z = noiseZ;
+  
+  return [x, y, z];
+};
+
 // --- Component: Foliage ---
-const Foliage = ({ state }: { state: 'CHAOS' | 'FORMED' }) => {
+const Foliage = ({ state, theme, showILoveYou }: { state: 'CHAOS' | 'FORMED', theme: 'TREE' | 'GALAXY' | 'HEART', showILoveYou?: boolean }) => {
   const materialRef = useRef<any>(null);
+  const geometryRef = useRef<THREE.BufferGeometry>(null);
+  const targetPositionsRef = useRef<Float32Array | null>(null);
+  
   const { positions, targetPositions, randoms } = useMemo(() => {
     const count = CONFIG.counts.foliage;
-    const positions = new Float32Array(count * 3); const targetPositions = new Float32Array(count * 3); const randoms = new Float32Array(count);
+    const positions = new Float32Array(count * 3); 
+    const targetPositions = new Float32Array(count * 3); 
+    const randoms = new Float32Array(count);
     const spherePoints = random.inSphere(new Float32Array(count * 3), { radius: 25 }) as Float32Array;
     for (let i = 0; i < count; i++) {
-      positions[i*3] = spherePoints[i*3]; positions[i*3+1] = spherePoints[i*3+1]; positions[i*3+2] = spherePoints[i*3+2];
-      const [tx, ty, tz] = getTreePosition();
-      targetPositions[i*3] = tx; targetPositions[i*3+1] = ty; targetPositions[i*3+2] = tz;
+      positions[i*3] = spherePoints[i*3]; 
+      positions[i*3+1] = spherePoints[i*3+1]; 
+      positions[i*3+2] = spherePoints[i*3+2];
+      // Use appropriate position based on theme or I LOVE YOU
+      let tx: number, ty: number, tz: number;
+      if (showILoveYou) {
+        [tx, ty, tz] = getILoveYouPosition(i, count);
+      } else if (theme === 'GALAXY') {
+        [tx, ty, tz] = getGalaxyPosition();
+      } else if (theme === 'HEART') {
+        [tx, ty, tz] = getHeartPosition();
+      } else {
+        [tx, ty, tz] = getTreePosition();
+      }
+      targetPositions[i*3] = tx; 
+      targetPositions[i*3+1] = ty; 
+      targetPositions[i*3+2] = tz;
       randoms[i] = Math.random();
     }
+    targetPositionsRef.current = targetPositions;
     return { positions, targetPositions, randoms };
-  }, []);
+  }, [theme, showILoveYou]);
+  
+  // Update target positions when theme changes dynamically
+  useEffect(() => {
+    if (geometryRef.current && targetPositionsRef.current) {
+      const count = CONFIG.counts.foliage;
+      for (let i = 0; i < count; i++) {
+        let tx: number, ty: number, tz: number;
+        if (showILoveYou) {
+          [tx, ty, tz] = getILoveYouPosition(i, count);
+        } else if (theme === 'GALAXY') {
+          [tx, ty, tz] = getGalaxyPosition();
+        } else if (theme === 'HEART') {
+          [tx, ty, tz] = getHeartPosition();
+        } else {
+          [tx, ty, tz] = getTreePosition();
+        }
+        targetPositionsRef.current[i*3] = tx;
+        targetPositionsRef.current[i*3+1] = ty;
+        targetPositionsRef.current[i*3+2] = tz;
+      }
+      const targetPosAttr = geometryRef.current.getAttribute('aTargetPos') as THREE.BufferAttribute;
+      if (targetPosAttr) {
+        targetPosAttr.needsUpdate = true;
+      }
+    }
+  }, [theme, showILoveYou]);
+  
+  const targetColorRef = useRef(new THREE.Color(
+    showILoveYou ? CONFIG.colors.loveRose :
+    theme === 'GALAXY' ? CONFIG.colors.galaxyColors[0] : 
+    theme === 'HEART' ? CONFIG.colors.loveRose : 
+    CONFIG.colors.loveRose
+  ));
+  
+  useEffect(() => {
+    targetColorRef.current = new THREE.Color(
+      showILoveYou ? CONFIG.colors.loveRose :
+      theme === 'GALAXY' ? CONFIG.colors.galaxyColors[0] : 
+      theme === 'HEART' ? CONFIG.colors.loveRose : 
+      CONFIG.colors.loveRose
+    );
+  }, [theme, showILoveYou]);
+  
   useFrame((rootState, delta) => {
     if (materialRef.current) {
       materialRef.current.uTime = rootState.clock.elapsedTime;
       const targetProgress = state === 'FORMED' ? 1 : 0;
       materialRef.current.uProgress = MathUtils.damp(materialRef.current.uProgress, targetProgress, 1.5, delta);
+      // Update color based on theme - use galaxy purple when GALAXY theme
+      materialRef.current.uColor.lerp(targetColorRef.current, delta * 2);
     }
   });
   return (
     <points>
-      <bufferGeometry>
+      <bufferGeometry ref={geometryRef}>
         <bufferAttribute attach="attributes-position" args={[positions, 3]} />
         <bufferAttribute attach="attributes-aTargetPos" args={[targetPositions, 3]} />
         <bufferAttribute attach="attributes-aRandom" args={[randoms, 1]} />
@@ -160,11 +467,13 @@ const Foliage = ({ state }: { state: 'CHAOS' | 'FORMED' }) => {
 };
 
 // --- Component: Photo Ornaments (Double-Sided Polaroid) ---
-const PhotoOrnaments = ({ state, onPhotoClick, zoomedPhotoIndex, cameraZoom }: { 
+const PhotoOrnaments = ({ state, onPhotoClick, zoomedPhotoIndex, cameraZoom, theme, showILoveYou }: { 
   state: 'CHAOS' | 'FORMED',
   onPhotoClick: (index: number) => void,
   zoomedPhotoIndex: number | null,
-  cameraZoom: number
+  cameraZoom: number,
+  theme: 'TREE' | 'GALAXY' | 'HEART',
+  showILoveYou?: boolean
 }) => {
   // Load textures with error handling - skip failed photos (no placeholders)
   const [textures, setTextures] = useState<THREE.Texture[]>([]);
@@ -295,6 +604,116 @@ const PhotoOrnaments = ({ state, onPhotoClick, zoomedPhotoIndex, cameraZoom }: {
       textureIndices.splice(count);
     }
     
+    // If showILoveYou, arrange photos to form "I LOVE YOU" text
+    if (showILoveYou) {
+      return new Array(count).fill(0).map((_, i) => {
+        const chaosPos = new THREE.Vector3((Math.random()-0.5)*120, (Math.random()-0.5)*120, (Math.random()-0.5)*120);
+        const [tx, ty, tz] = getILoveYouPosition(i, count);
+        const targetPos = new THREE.Vector3(tx, ty, tz);
+
+        const isBig = Math.random() < 0.1;
+        const baseScale = isBig ? 2.5 : 1.0 + Math.random() * 0.8;
+        const weight = 0.6 + Math.random() * 0.9;
+        const borderColor = CONFIG.colors.loveColors[Math.floor(Math.random() * CONFIG.colors.loveColors.length)];
+
+        const rotationSpeed = { x: 0, y: 0, z: 0 };
+        const chaosRotation = new THREE.Euler(0, 0, 0);
+
+        let textureIndex = 0;
+        if (numTextures > 0) textureIndex = textureIndices.length > 0 ? textureIndices[i] : (i % numTextures);
+
+        return {
+          chaosPos, targetPos, scale: baseScale, weight,
+          textureIndex,
+          borderColor,
+          currentPos: chaosPos.clone(),
+          chaosRotation,
+          rotationSpeed,
+          wobbleOffset: Math.random() * 10,
+          wobbleSpeed: 0.2 + Math.random() * 0.3,
+          zoomScale: 1,
+          targetZoomScale: 1,
+          isZoomed: false
+        };
+      });
+    }
+    
+    // If theme is HEART, arrange photos in a heart formation
+    if (theme === 'HEART') {
+      return new Array(count).fill(0).map((_, i) => {
+        const chaosPos = new THREE.Vector3((Math.random()-0.5)*120, (Math.random()-0.5)*120, (Math.random()-0.5)*120);
+        const [tx, ty, tz] = getHeartPosition();
+        const targetPos = new THREE.Vector3(tx, ty, tz);
+
+        const isBig = Math.random() < 0.15;
+        const baseScale = isBig ? 3.2 : 1.3 + Math.random() * 0.9;
+        const weight = 0.7 + Math.random() * 1.0;
+        const borderColor = CONFIG.colors.loveColors[Math.floor(Math.random() * CONFIG.colors.loveColors.length)];
+
+        const rotationSpeed = { x: (Math.random() - 0.5) * 0.5, y: (Math.random() - 0.5) * 0.5, z: (Math.random() - 0.5) * 0.5 };
+        const chaosRotation = new THREE.Euler(Math.random()*Math.PI, Math.random()*Math.PI, Math.random()*Math.PI);
+
+        let textureIndex = 0;
+        if (numTextures > 0) textureIndex = textureIndices.length > 0 ? textureIndices[i] : (i % numTextures);
+
+        return {
+          chaosPos, targetPos, scale: baseScale, weight,
+          textureIndex,
+          borderColor,
+          currentPos: chaosPos.clone(),
+          chaosRotation,
+          rotationSpeed,
+          wobbleOffset: Math.random() * 10,
+          wobbleSpeed: 0.3 + Math.random() * 0.4,
+          zoomScale: 1,
+          targetZoomScale: 1,
+          isZoomed: false
+        };
+      });
+    }
+    
+    // If theme is GALAXY, arrange photos in a spiral galaxy formation
+    if (theme === 'GALAXY') {
+      const arms = 3; // number of spiral arms
+      const maxR = 40; // galaxy radius
+      return new Array(count).fill(0).map((_, i) => {
+        const chaosPos = new THREE.Vector3((Math.random()-0.5)*120, (Math.random()-0.5)*120, (Math.random()-0.5)*120);
+        // radial distribution: more density near center
+        const r = Math.pow(Math.random(), 0.7) * maxR;
+        const arm = i % arms;
+        const baseAngle = (arm / arms) * Math.PI * 2;
+        const theta = baseAngle + r * 0.15 + (Math.random() - 0.5) * 0.6; // add noise
+        const z = (Math.random() - 0.5) * 6 * (r / maxR); // slight thickness
+        const targetPos = new THREE.Vector3(r * Math.cos(theta), z, r * Math.sin(theta));
+
+        const isBig = Math.random() < 0.12;
+        const baseScale = isBig ? 3.0 : 1.2 + Math.random() * 0.8;
+        const weight = 0.6 + Math.random() * 0.8;
+        const borderColor = CONFIG.colors.galaxyColors[Math.floor(Math.random() * CONFIG.colors.galaxyColors.length)];
+
+        const rotationSpeed = { x: 0, y: 0.02 + Math.random() * 0.06, z: 0 };
+        const chaosRotation = new THREE.Euler(0, Math.random()*Math.PI, 0);
+
+        let textureIndex = 0;
+        if (numTextures > 0) textureIndex = textureIndices.length > 0 ? textureIndices[i] : (i % numTextures);
+
+        return {
+          chaosPos, targetPos, scale: baseScale, weight,
+          textureIndex,
+          borderColor,
+          currentPos: chaosPos.clone(),
+          chaosRotation,
+          rotationSpeed,
+          wobbleOffset: Math.random() * 10,
+          wobbleSpeed: 0.2 + Math.random() * 0.3,
+          zoomScale: 1,
+          targetZoomScale: 1,
+          isZoomed: false
+        };
+      });
+    }
+
+    // Default TREE arrangement (original behavior)
     return new Array(count).fill(0).map((_, i) => {
       const chaosPos = new THREE.Vector3((Math.random()-0.5)*70, (Math.random()-0.5)*70, (Math.random()-0.5)*70);
       const h = CONFIG.tree.height; const y = (Math.random() * h) - (h / 2);
@@ -304,18 +723,13 @@ const PhotoOrnaments = ({ state, onPhotoClick, zoomedPhotoIndex, cameraZoom }: {
       const targetPos = new THREE.Vector3(currentRadius * Math.cos(theta), y, currentRadius * Math.sin(theta));
 
       const isBig = Math.random() < 0.3;
-      const baseScale = isBig ? 3.5 : 1.5 + Math.random() * 1.2; // Increased base scale for better visibility
+      const baseScale = isBig ? 3.5 : 1.5 + Math.random() * 1.2;
       const weight = 0.8 + Math.random() * 1.2;
       const borderColor = CONFIG.colors.borders[Math.floor(Math.random() * CONFIG.colors.borders.length)];
 
-      const rotationSpeed = {
-        x: (Math.random() - 0.5) * 1.0,
-        y: (Math.random() - 0.5) * 1.0,
-        z: (Math.random() - 0.5) * 1.0
-      };
+      const rotationSpeed = { x: (Math.random() - 0.5) * 1.0, y: (Math.random() - 0.5) * 1.0, z: (Math.random() - 0.5) * 1.0 };
       const chaosRotation = new THREE.Euler(Math.random()*Math.PI, Math.random()*Math.PI, Math.random()*Math.PI);
 
-      // Assign texture index - use random if textures not loaded yet
       let textureIndex = 0;
       if (numTextures > 0) {
         textureIndex = textureIndices.length > 0 ? textureIndices[i] : (i % numTextures);
@@ -335,7 +749,7 @@ const PhotoOrnaments = ({ state, onPhotoClick, zoomedPhotoIndex, cameraZoom }: {
         isZoomed: false
       };
     });
-  }, [validatedTextures, count]);
+  }, [validatedTextures, count, theme, showILoveYou]);
 
   useFrame((stateObj, delta) => {
     if (!groupRef.current) return;
@@ -526,7 +940,7 @@ const PhotoOrnaments = ({ state, onPhotoClick, zoomedPhotoIndex, cameraZoom }: {
                 map={texture}
                 roughness={0.4} 
                 metalness={0.0}
-                emissive={CONFIG.colors.stardust} 
+                emissive={showILoveYou ? CONFIG.colors.loveRose : theme === 'GALAXY' ? CONFIG.colors.galaxyColors[0] : theme === 'HEART' ? CONFIG.colors.loveRose : CONFIG.colors.stardust} 
                 emissiveMap={texture} 
                 emissiveIntensity={0.8}
                 side={THREE.FrontSide}
@@ -538,7 +952,7 @@ const PhotoOrnaments = ({ state, onPhotoClick, zoomedPhotoIndex, cameraZoom }: {
                 color={obj.borderColor} 
                 roughness={0.8} 
                 metalness={0.0}
-                emissive={CONFIG.colors.loveRose}
+                emissive={showILoveYou ? obj.borderColor : theme === 'GALAXY' ? obj.borderColor : theme === 'HEART' ? obj.borderColor : CONFIG.colors.loveRose}
                 emissiveIntensity={0.15}
                 side={THREE.FrontSide} 
               />
@@ -551,7 +965,7 @@ const PhotoOrnaments = ({ state, onPhotoClick, zoomedPhotoIndex, cameraZoom }: {
                 map={texture}
                 roughness={0.4} 
                 metalness={0.0}
-                emissive={CONFIG.colors.stardust} 
+                emissive={showILoveYou ? CONFIG.colors.loveRose : theme === 'GALAXY' ? CONFIG.colors.galaxyColors[0] : theme === 'HEART' ? CONFIG.colors.loveRose : CONFIG.colors.stardust} 
                 emissiveMap={texture} 
                 emissiveIntensity={0.8}
                 side={THREE.FrontSide}
@@ -563,7 +977,7 @@ const PhotoOrnaments = ({ state, onPhotoClick, zoomedPhotoIndex, cameraZoom }: {
                 color={obj.borderColor} 
                 roughness={0.8} 
                 metalness={0.0}
-                emissive={CONFIG.colors.loveRose}
+                emissive={showILoveYou ? obj.borderColor : theme === 'GALAXY' ? obj.borderColor : theme === 'HEART' ? obj.borderColor : CONFIG.colors.loveRose}
                 emissiveIntensity={0.15}
                 side={THREE.FrontSide} 
               />
@@ -589,7 +1003,7 @@ const createHeartShape = () => {
 };
 
 // --- Component: Love Elements (Hearts, Roses, Gifts) ---
-const LoveElements = ({ state }: { state: 'CHAOS' | 'FORMED' }) => {
+const LoveElements = ({ state, theme, showILoveYou }: { state: 'CHAOS' | 'FORMED', theme: 'TREE' | 'GALAXY' | 'HEART', showILoveYou?: boolean }) => {
   const count = CONFIG.counts.elements;
   const groupRef = useRef<THREE.Group>(null);
 
@@ -629,41 +1043,69 @@ const LoveElements = ({ state }: { state: 'CHAOS' | 'FORMED' }) => {
   }, []);
 
   const data = useMemo(() => {
-    return new Array(count).fill(0).map(() => {
+    return new Array(count).fill(0).map((_, i) => {
       const chaosPos = new THREE.Vector3((Math.random()-0.5)*60, (Math.random()-0.5)*60, (Math.random()-0.5)*60);
-      const h = CONFIG.tree.height;
-      const y = (Math.random() * h) - (h / 2);
-      const rBase = CONFIG.tree.radius;
-      const currentRadius = (rBase * (1 - (y + (h/2)) / h)) * 0.95;
-      const theta = Math.random() * Math.PI * 2;
-
-      const targetPos = new THREE.Vector3(currentRadius * Math.cos(theta), y, currentRadius * Math.sin(theta));
+      
+      // Use appropriate position based on theme or I LOVE YOU
+      let targetPos: THREE.Vector3;
+      if (showILoveYou) {
+        const [tx, ty, tz] = getILoveYouPosition(i, count);
+        targetPos = new THREE.Vector3(tx, ty, tz);
+      } else if (theme === 'GALAXY') {
+        const arms = 3;
+        const maxR = 35;
+        const r = Math.pow(Math.random(), 0.7) * maxR;
+        const arm = Math.floor(Math.random() * arms);
+        const baseAngle = (arm / arms) * Math.PI * 2;
+        const theta = baseAngle + r * 0.2 + (Math.random() - 0.5) * 0.8;
+        const z = (Math.random() - 0.5) * 8 * (r / maxR);
+        targetPos = new THREE.Vector3(r * Math.cos(theta), z, r * Math.sin(theta));
+      } else if (theme === 'HEART') {
+        const [tx, ty, tz] = getHeartPosition();
+        targetPos = new THREE.Vector3(tx, ty, tz);
+      } else {
+        const h = CONFIG.tree.height;
+        const y = (Math.random() * h) - (h / 2);
+        const rBase = CONFIG.tree.radius;
+        const currentRadius = (rBase * (1 - (y + (h/2)) / h)) * 0.95;
+        const theta = Math.random() * Math.PI * 2;
+        targetPos = new THREE.Vector3(currentRadius * Math.cos(theta), y, currentRadius * Math.sin(theta));
+      }
 
       // 4 types: Hearts (Love), Stars (New Year), Gifts (New Year), Orbs (Galaxy)
       const type = Math.floor(Math.random() * 4);
       let color; let scale = 1;
-      if (type === 0) { 
-        // Hearts - Love theme
-        color = CONFIG.colors.loveColors[Math.floor(Math.random() * CONFIG.colors.loveColors.length)]; 
-        scale = 0.8 + Math.random() * 0.4; 
-      } else if (type === 1) { 
-        // Stars - New Year theme
-        color = CONFIG.colors.newYearColors[Math.floor(Math.random() * CONFIG.colors.newYearColors.length)]; 
-        scale = 0.6 + Math.random() * 0.5; 
-      } else if (type === 2) {
-        // Gifts/Boxes - New Year theme
-        color = CONFIG.colors.newYearColors[Math.floor(Math.random() * CONFIG.colors.newYearColors.length)]; 
-        scale = 0.7 + Math.random() * 0.4; 
-      } else { 
-        // Orbs - Galaxy theme
-        color = CONFIG.colors.galaxyColors[Math.floor(Math.random() * CONFIG.colors.galaxyColors.length)]; 
-        scale = 0.6 + Math.random() * 0.4; 
+      // Use appropriate colors based on theme
+      if (theme === 'GALAXY') {
+        color = CONFIG.colors.galaxyColors[Math.floor(Math.random() * CONFIG.colors.galaxyColors.length)];
+        scale = 0.6 + Math.random() * 0.5;
+      } else if (theme === 'HEART') {
+        color = CONFIG.colors.loveColors[Math.floor(Math.random() * CONFIG.colors.loveColors.length)];
+        scale = 0.7 + Math.random() * 0.5;
+      } else {
+        if (type === 0) { 
+          // Hearts - Love theme
+          color = CONFIG.colors.loveColors[Math.floor(Math.random() * CONFIG.colors.loveColors.length)]; 
+          scale = 0.8 + Math.random() * 0.4; 
+        } else if (type === 1) { 
+          // Stars - New Year theme
+          color = CONFIG.colors.newYearColors[Math.floor(Math.random() * CONFIG.colors.newYearColors.length)]; 
+          scale = 0.6 + Math.random() * 0.5; 
+        } else if (type === 2) {
+          // Gifts/Boxes - New Year theme
+          color = CONFIG.colors.newYearColors[Math.floor(Math.random() * CONFIG.colors.newYearColors.length)]; 
+          scale = 0.7 + Math.random() * 0.4; 
+        } else { 
+          // Orbs - Galaxy theme
+          color = CONFIG.colors.galaxyColors[Math.floor(Math.random() * CONFIG.colors.galaxyColors.length)]; 
+          scale = 0.6 + Math.random() * 0.4; 
+        }
       }
 
       const rotationSpeed = { x: (Math.random()-0.5)*2.0, y: (Math.random()-0.5)*2.0, z: (Math.random()-0.5)*2.0 };
       return { type, chaosPos, targetPos, color, scale, currentPos: chaosPos.clone(), chaosRotation: new THREE.Euler(Math.random()*Math.PI, Math.random()*Math.PI, Math.random()*Math.PI), rotationSpeed };
     });
-  }, [boxGeometry, sphereGeometry, heartGeometry, starGeometry]);
+  }, [boxGeometry, sphereGeometry, heartGeometry, starGeometry, theme, showILoveYou]);
 
   useFrame((_, delta) => {
     if (!groupRef.current) return;
@@ -800,22 +1242,53 @@ const Fireworks = ({ state }: { state: 'CHAOS' | 'FORMED' }) => {
 };
 
 // --- Component: Fairy Lights ---
-const FairyLights = ({ state }: { state: 'CHAOS' | 'FORMED' }) => {
+const FairyLights = ({ state, theme, showILoveYou }: { state: 'CHAOS' | 'FORMED', theme: 'TREE' | 'GALAXY' | 'HEART', showILoveYou?: boolean }) => {
   const count = CONFIG.counts.lights;
   const groupRef = useRef<THREE.Group>(null);
   const geometry = useMemo(() => new THREE.SphereGeometry(0.8, 8, 8), []);
 
   const data = useMemo(() => {
-    return new Array(count).fill(0).map(() => {
+    return new Array(count).fill(0).map((_, i) => {
       const chaosPos = new THREE.Vector3((Math.random()-0.5)*60, (Math.random()-0.5)*60, (Math.random()-0.5)*60);
-      const h = CONFIG.tree.height; const y = (Math.random() * h) - (h / 2); const rBase = CONFIG.tree.radius;
-      const currentRadius = (rBase * (1 - (y + (h/2)) / h)) + 0.3; const theta = Math.random() * Math.PI * 2;
-      const targetPos = new THREE.Vector3(currentRadius * Math.cos(theta), y, currentRadius * Math.sin(theta));
-      const color = CONFIG.colors.lights[Math.floor(Math.random() * CONFIG.colors.lights.length)];
+      
+      // Use appropriate position based on theme or I LOVE YOU
+      let targetPos: THREE.Vector3;
+      if (showILoveYou) {
+        const [tx, ty, tz] = getILoveYouPosition(i, count);
+        targetPos = new THREE.Vector3(tx, ty, tz);
+      } else if (theme === 'GALAXY') {
+        const arms = 3;
+        const maxR = 38;
+        const r = Math.pow(Math.random(), 0.7) * maxR;
+        const arm = Math.floor(Math.random() * arms);
+        const baseAngle = (arm / arms) * Math.PI * 2;
+        const theta = baseAngle + r * 0.18 + (Math.random() - 0.5) * 0.7;
+        const z = (Math.random() - 0.5) * 7 * (r / maxR);
+        targetPos = new THREE.Vector3(r * Math.cos(theta), z, r * Math.sin(theta));
+      } else if (theme === 'HEART') {
+        const [tx, ty, tz] = getHeartPosition();
+        targetPos = new THREE.Vector3(tx, ty, tz);
+      } else {
+        const h = CONFIG.tree.height; 
+        const y = (Math.random() * h) - (h / 2); 
+        const rBase = CONFIG.tree.radius;
+        const currentRadius = (rBase * (1 - (y + (h/2)) / h)) + 0.3; 
+        const theta = Math.random() * Math.PI * 2;
+        targetPos = new THREE.Vector3(currentRadius * Math.cos(theta), y, currentRadius * Math.sin(theta));
+      }
+      
+      // Use appropriate colors based on theme or I LOVE YOU
+      const color = showILoveYou
+        ? CONFIG.colors.loveColors[Math.floor(Math.random() * CONFIG.colors.loveColors.length)]
+        : theme === 'GALAXY' 
+        ? CONFIG.colors.galaxyColors[Math.floor(Math.random() * CONFIG.colors.galaxyColors.length)]
+        : theme === 'HEART'
+        ? CONFIG.colors.loveColors[Math.floor(Math.random() * CONFIG.colors.loveColors.length)]
+        : CONFIG.colors.lights[Math.floor(Math.random() * CONFIG.colors.lights.length)];
       const speed = 2 + Math.random() * 3;
       return { chaosPos, targetPos, color, speed, currentPos: chaosPos.clone(), timeOffset: Math.random() * 100 };
     });
-  }, []);
+  }, [theme, showILoveYou]);
 
   useFrame((stateObj, delta) => {
     if (!groupRef.current) return;
@@ -898,13 +1371,17 @@ const Experience = memo(({
   rotationSpeed, 
   cameraZoom, 
   onPhotoClick, 
-  zoomedPhotoIndex 
+  zoomedPhotoIndex,
+  theme,
+  showILoveYou
 }: { 
   sceneState: 'CHAOS' | 'FORMED',
   rotationSpeed: number,
   cameraZoom: number,
   onPhotoClick: (index: number) => void,
-  zoomedPhotoIndex: number | null
+  zoomedPhotoIndex: number | null,
+  theme: 'TREE' | 'GALAXY' | 'HEART',
+  showILoveYou?: boolean
 }) => {
   const controlsRef = useRef<any>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera>(null);
@@ -937,40 +1414,44 @@ const Experience = memo(({
         maxPolarAngle={Math.PI / 1.7} 
       />
 
-      <color attach="background" args={[CONFIG.colors.background]} />
+      <color attach="background" args={[
+        theme === 'GALAXY' ? CONFIG.colors.galaxyDeep : 
+        theme === 'HEART' ? CONFIG.colors.background : 
+        CONFIG.colors.background
+      ]} />
       <Stars radius={200} depth={100} count={12000} factor={8} saturation={0.7} fade speed={2} />
       {/* Environment disabled to reduce WebGL context usage */}
       {/* <Environment preset="night" background={false} /> */}
 
       {/* Enhanced lighting for New Year + Galaxy + Love theme */}
-      <ambientLight intensity={0.4} color={CONFIG.colors.galaxyNebula} />
-      <pointLight position={[30, 30, 30]} intensity={180} color={CONFIG.colors.loveRose} />
-      <pointLight position={[-30, 10, -30]} intensity={100} color={CONFIG.colors.lovePink} />
-      <pointLight position={[0, -20, 10]} intensity={80} color={CONFIG.colors.accent} />
-      <pointLight position={[0, 40, 0]} intensity={120} color={CONFIG.colors.loveRose} />
-      <pointLight position={[20, 20, -20]} intensity={90} color={CONFIG.colors.fireworksBlue} />
-      <pointLight position={[-20, 20, -20]} intensity={90} color={CONFIG.colors.fireworksGreen} />
+      <ambientLight intensity={0.4} color={theme === 'GALAXY' ? CONFIG.colors.galaxyNebula : CONFIG.colors.galaxyNebula} />
+      <pointLight position={[30, 30, 30]} intensity={180} color={theme === 'GALAXY' ? CONFIG.colors.accent : CONFIG.colors.loveRose} />
+      <pointLight position={[-30, 10, -30]} intensity={100} color={theme === 'GALAXY' ? CONFIG.colors.galaxyNebula : CONFIG.colors.lovePink} />
+      <pointLight position={[0, -20, 10]} intensity={80} color={theme === 'GALAXY' ? CONFIG.colors.accent : CONFIG.colors.accent} />
+      <pointLight position={[0, 40, 0]} intensity={120} color={theme === 'GALAXY' ? CONFIG.colors.accent : CONFIG.colors.loveRose} />
+      <pointLight position={[20, 20, -20]} intensity={90} color={theme === 'GALAXY' ? CONFIG.colors.fireworksBlue : CONFIG.colors.fireworksBlue} />
+      <pointLight position={[-20, 20, -20]} intensity={90} color={theme === 'GALAXY' ? CONFIG.colors.galaxyNebula : CONFIG.colors.fireworksGreen} />
       {/* Additional light focused on photo area for better visibility */}
-      <pointLight position={[0, 0, 30]} intensity={180} color={CONFIG.colors.stardust} />
+      <pointLight position={[0, 0, 30]} intensity={180} color={theme === 'GALAXY' ? CONFIG.colors.galaxyColors[0] : CONFIG.colors.stardust} />
       {/* Extra light for zoomed photos */}
       {zoomedPhotoIndex !== null && (
-        <pointLight position={[0, 0, 25]} intensity={120} color={CONFIG.colors.stardust} />
+        <pointLight position={[0, 0, 25]} intensity={120} color={theme === 'GALAXY' ? CONFIG.colors.galaxyColors[0] : CONFIG.colors.stardust} />
       )}
 
       <group position={[0, -6, 0]}>
-        <Foliage state={sceneState} />
+        <Foliage state={sceneState} theme={theme} showILoveYou={showILoveYou} />
         <Suspense fallback={null}>
-           <PhotoOrnaments state={sceneState} onPhotoClick={onPhotoClick} zoomedPhotoIndex={zoomedPhotoIndex} cameraZoom={cameraZoom} />
-           <LoveElements state={sceneState} />
-           <FairyLights state={sceneState} />
+           <PhotoOrnaments state={sceneState} onPhotoClick={onPhotoClick} zoomedPhotoIndex={zoomedPhotoIndex} cameraZoom={cameraZoom} theme={theme} showILoveYou={showILoveYou} />
+           <LoveElements state={sceneState} theme={theme} showILoveYou={showILoveYou} />
+           <FairyLights state={sceneState} theme={theme} showILoveYou={showILoveYou} />
            <Fireworks state={sceneState} />
            <TopHeart state={sceneState} />
         </Suspense>
         {/* Multiple sparkle layers for richer New Year + Galaxy + Love effect */}
-        <Sparkles count={1200} scale={90} size={14} speed={1.0} opacity={1.0} color={CONFIG.colors.loveRose} />
-        <Sparkles count={900} scale={75} size={10} speed={1.4} opacity={0.7} color={CONFIG.colors.lovePink} />
-        <Sparkles count={700} scale={85} size={8} speed={0.7} opacity={0.6} color={CONFIG.colors.accent} />
-        <Sparkles count={500} scale={70} size={6} speed={0.5} opacity={0.5} color={CONFIG.colors.fireworksBlue} />
+        <Sparkles count={1200} scale={90} size={14} speed={1.0} opacity={1.0} color={theme === 'GALAXY' ? CONFIG.colors.accent : theme === 'HEART' ? CONFIG.colors.loveRose : CONFIG.colors.loveRose} />
+        <Sparkles count={900} scale={75} size={10} speed={1.4} opacity={0.7} color={theme === 'GALAXY' ? CONFIG.colors.galaxyColors[0] : theme === 'HEART' ? CONFIG.colors.lovePink : CONFIG.colors.lovePink} />
+        <Sparkles count={700} scale={85} size={8} speed={0.7} opacity={0.6} color={theme === 'GALAXY' ? CONFIG.colors.galaxyColors[1] : theme === 'HEART' ? CONFIG.colors.loveCoral : CONFIG.colors.accent} />
+        <Sparkles count={500} scale={70} size={6} speed={0.5} opacity={0.5} color={theme === 'GALAXY' ? CONFIG.colors.galaxyColors[2] : theme === 'HEART' ? CONFIG.colors.warmGlow : CONFIG.colors.fireworksBlue} />
       </group>
 
       <EffectComposer>
@@ -983,7 +1464,7 @@ const Experience = memo(({
 
 // --- Gesture Controller ---
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const GestureController = ({ onGesture, onMove, onZoom, onStatus, debugMode }: any) => {
+const GestureController = ({ onGesture, onMove, onZoom, onStatus, onTheme, onUnmute, onILoveYou, debugMode }: any) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const lastHandPositions = useRef<{ x: number, y: number, z: number }[]>([]);
@@ -994,6 +1475,11 @@ const GestureController = ({ onGesture, onMove, onZoom, onStatus, debugMode }: a
   const onMoveRef = useRef(onMove);
   const onZoomRef = useRef(onZoom);
   const onStatusRef = useRef(onStatus);
+  const onThemeRef = useRef(onTheme);
+  const onUnmuteRef = useRef(onUnmute);
+  const onILoveYouRef = useRef(onILoveYou);
+  const themeCandidateRef = useRef<'TREE' | 'GALAXY' | 'HEART' | null>(null);
+  const themeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const gestureRecognizerRef = useRef<GestureRecognizer | null>(null);
   const requestRef = useRef<number | null>(null);
   const isSettingUpRef = useRef(false);
@@ -1004,7 +1490,10 @@ const GestureController = ({ onGesture, onMove, onZoom, onStatus, debugMode }: a
     onMoveRef.current = onMove;
     onZoomRef.current = onZoom;
     onStatusRef.current = onStatus;
-  }, [onGesture, onMove, onZoom, onStatus]);
+    onThemeRef.current = onTheme;
+    onUnmuteRef.current = onUnmute;
+    onILoveYouRef.current = onILoveYou;
+  }, [onGesture, onMove, onZoom, onStatus, onUnmute, onILoveYou]);
 
   // Delay initialization to ensure Canvas renders first
   useEffect(() => {
@@ -1035,12 +1524,16 @@ const GestureController = ({ onGesture, onMove, onZoom, onStatus, debugMode }: a
             } else if (ctx && !debugMode) ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
 
             // Handle gestures and hand tracking
-            if (results.gestures.length > 0) {
+              if (results.gestures.length > 0) {
               const name = results.gestures[0][0].categoryName; 
               const score = results.gestures[0][0].score;
               
               if (score > 0.4) {
-                 if (name === "Open_Palm") onGestureRef.current("CHAOS"); 
+                if (name === "Open_Palm") {
+                 onGestureRef.current("CHAOS");
+                 // trigger unmute when user opens hand
+                 try { onUnmuteRef.current && onUnmuteRef.current(); } catch (e) { console.warn('onUnmute handler failed', e); }
+                }
                  if (name === "Closed_Fist") onGestureRef.current("FORMED");
                  if (debugMode) onStatusRef.current(`DETECTED: ${name}`);
               }
@@ -1057,6 +1550,86 @@ const GestureController = ({ onGesture, onMove, onZoom, onStatus, debugMode }: a
 
               // Store hand position
               lastHandPositions.current[0] = { x: wrist.x, y: wrist.y, z: wrist.z };
+
+              // Detect "index finger only" (pointing with only index extended)
+              try {
+                const tip = (i: number) => landmarks[i];
+                const isExtended = (tipIdx: number, pipIdx: number) => {
+                  // In normalized coords, smaller y is higher. Check tip is notably above pip.
+                  return tip(tipIdx).y + 0.02 < landmarks[pipIdx].y;
+                };
+                const indexExtended = isExtended(8, 6);
+                const middleExtended = isExtended(12, 10);
+                const ringExtended = isExtended(16, 14);
+                const pinkyExtended = isExtended(20, 18);
+                
+                // Detect thumb extended (thumb tip 4, thumb MCP 2)
+                // Thumb is extended if tip is far from base (different x or y coordinate)
+                const thumbTip = landmarks[4];
+                const thumbMCP = landmarks[2];
+                const thumbExtended = Math.abs(thumbTip.x - thumbMCP.x) > 0.08 || Math.abs(thumbTip.y - thumbMCP.y) > 0.08;
+
+                // Detect "I Love You" sign: thumb + index + pinky extended, middle + ring folded
+                const iLoveYouSign = thumbExtended && indexExtended && pinkyExtended && !middleExtended && !ringExtended;
+
+                // Detect gestures:
+                // "I Love You" (thumb + index + pinky extended, middle + ring folded) → Show "I LOVE YOU"
+                // Victory (index + middle extended, others closed) → HEART
+                // Pointing (only index extended) → GALAXY
+                // Otherwise → TREE
+                
+                // Handle "I Love You" sign detection
+                if (iLoveYouSign && onILoveYouRef.current) {
+                  try {
+                    onILoveYouRef.current(true);
+                    if (debugMode) onStatusRef.current(`💕 I LOVE YOU SIGN DETECTED 💕`);
+                  } catch (e) {
+                    console.warn('onILoveYou handler failed', e);
+                  }
+                } else if (!iLoveYouSign && onILoveYouRef.current) {
+                  try {
+                    onILoveYouRef.current(false);
+                  } catch (e) {
+                    // Ignore
+                  }
+                }
+                
+                let detectedTheme: 'TREE' | 'GALAXY' | 'HEART' = 'TREE';
+                if (indexExtended && middleExtended && !ringExtended && !pinkyExtended) {
+                  detectedTheme = 'HEART'; // Victory gesture
+                } else if (indexExtended && !middleExtended && !ringExtended && !pinkyExtended) {
+                  detectedTheme = 'GALAXY'; // Pointing gesture
+                }
+                
+                // Debounce: only switch theme if detected consistently for 400ms
+                if (themeCandidateRef.current !== detectedTheme) {
+                  // reset existing timer
+                  if (themeTimerRef.current) { clearTimeout(themeTimerRef.current); themeTimerRef.current = null; }
+                  themeCandidateRef.current = detectedTheme;
+                  themeTimerRef.current = setTimeout(() => {
+                    if (onThemeRef.current) {
+                      onThemeRef.current(detectedTheme);
+                      // When pointing (GALAXY) or victory (HEART), also set state to FORMED to transform
+                      if (detectedTheme === 'GALAXY' || detectedTheme === 'HEART') {
+                        onGestureRef.current("FORMED");
+                        if (debugMode) {
+                          if (detectedTheme === 'GALAXY') {
+                            onStatusRef.current(`✨ POINTING → GALAXY TRANSFORMATION ✨`);
+                          } else if (detectedTheme === 'HEART') {
+                            onStatusRef.current(`💖 VICTORY → HEART TRANSFORMATION 💖`);
+                          }
+                        }
+                      }
+                    }
+                    if (debugMode && detectedTheme === 'TREE') {
+                      onStatusRef.current(`THEME: ${detectedTheme}`);
+                    }
+                    themeTimerRef.current = null;
+                  }, 400);
+                }
+              } catch (e) {
+                // ignore detection errors
+              }
             }
 
             // PRIMARY ZOOM METHOD: Two-hand distance - hands closer = zoom in, farther = zoom out
@@ -1157,6 +1730,9 @@ const GestureController = ({ onGesture, onMove, onZoom, onStatus, debugMode }: a
         tracks.forEach(track => track.stop());
         videoRef.current.srcObject = null;
       }
+      // Clear theme debounce timer if any
+      if (themeTimerRef.current) { clearTimeout(themeTimerRef.current); themeTimerRef.current = null; }
+      themeCandidateRef.current = null;
       // Close gesture recognizer if it exists
       if (gestureRecognizerRef.current) {
         try {
@@ -1211,6 +1787,7 @@ const GestureController = ({ onGesture, onMove, onZoom, onStatus, debugMode }: a
 // --- App Entry ---
 export default function GrandTreeApp() {
   const [sceneState, setSceneState] = useState<'CHAOS' | 'FORMED'>('FORMED');
+  const [theme, setTheme] = useState<'TREE' | 'GALAXY' | 'HEART'>('TREE');
   const [rotationSpeed, setRotationSpeed] = useState(0);
   const [cameraZoom, setCameraZoom] = useState(0);
   const [zoomedPhotoIndex, setZoomedPhotoIndex] = useState<number | null>(null);
@@ -1218,6 +1795,7 @@ export default function GrandTreeApp() {
   const [debugMode, setDebugMode] = useState(false);
   const [gestureEnabled, setGestureEnabled] = useState(false);
   const [showGestureGuide, setShowGestureGuide] = useState(false);
+  const [showILoveYou, setShowILoveYou] = useState(false);
   const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
   
   // Track window size for responsive design
@@ -1240,6 +1818,7 @@ export default function GrandTreeApp() {
   };
 
   const zoomTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const musicRef = useRef<{ unmute?: () => Promise<void> | void } | null>(null);
   
   const handleZoom = (zoomValue: number) => {
     // Clear existing timeout
@@ -1315,15 +1894,22 @@ export default function GrandTreeApp() {
               cameraZoom={cameraZoom}
               onPhotoClick={handlePhotoClick}
               zoomedPhotoIndex={zoomedPhotoIndex}
+              theme={theme}
+              showILoveYou={showILoveYou}
             />
         </Canvas>
       </div>
+      {/* Background music player: tries to autoplay /music.mp3 and can be unmuted when gestures enabled */}
+      <BackgroundMusic ref={musicRef} />
       {gestureEnabled && (
         <GestureController 
           onGesture={setSceneState} 
           onMove={setRotationSpeed} 
           onZoom={handleZoom}
           onStatus={setAiStatus} 
+          onTheme={setTheme}
+          onUnmute={() => { try { musicRef.current?.unmute && musicRef.current.unmute(); } catch (e) { console.warn('music unmute failed', e); } }}
+          onILoveYou={setShowILoveYou}
           debugMode={debugMode} 
         />
       )}
@@ -1363,7 +1949,13 @@ export default function GrandTreeApp() {
         flexDirection: 'column' 
       }}>
         <button 
-          onClick={() => setGestureEnabled(!gestureEnabled)} 
+          onClick={() => {
+            const newVal = !gestureEnabled;
+            setGestureEnabled(newVal);
+            if (newVal) {
+              try { musicRef.current?.unmute && musicRef.current.unmute(); } catch (e) { console.warn('Music unmute failed', e); }
+            }
+          }}
           style={{ 
             padding: isMobile ? '10px 12px' : '12px 15px', 
             backgroundColor: gestureEnabled ? CONFIG.colors.loveRose : 'rgba(10, 10, 26, 0.8)', 
@@ -1382,50 +1974,26 @@ export default function GrandTreeApp() {
         >
            {gestureEnabled ? '🖐️ GESTURES ON' : '🖐️ ENABLE GESTURES'}
         </button>
-        <div style={{ display: 'flex', gap: isMobile ? '8px' : '10px', flexDirection: isMobile ? 'column' : 'row' }}>
-          <button 
-            onClick={() => setDebugMode(!debugMode)} 
-            style={{ 
-              padding: isMobile ? '10px 12px' : '12px 15px', 
-              backgroundColor: debugMode ? CONFIG.colors.fireworksBlue : 'rgba(10, 10, 26, 0.8)', 
-              border: `2px solid ${CONFIG.colors.fireworksBlue}`, 
-              color: debugMode ? '#000' : CONFIG.colors.fireworksBlue, 
-              fontFamily: 'sans-serif', 
-              fontSize: isMobile ? '10px' : '12px', 
-              fontWeight: 'bold', 
-              cursor: 'pointer', 
-              touchAction: 'manipulation',
-              WebkitTapHighlightColor: 'transparent',
-              backdropFilter: 'blur(8px)', 
-              boxShadow: debugMode ? `0 0 15px ${CONFIG.colors.fireworksBlue}` : 'none', 
-              transition: 'all 0.3s' 
-            }}
-          >
-             {debugMode ? 'HIDE DEBUG' : '🛠 DEBUG'}
-          </button>
-          <button 
-            onClick={() => setSceneState(s => s === 'CHAOS' ? 'FORMED' : 'CHAOS')} 
-            style={{ 
-              padding: isMobile ? '10px 20px' : '12px 30px', 
-              backgroundColor: 'rgba(10, 10, 26, 0.8)', 
-              border: `2px solid ${CONFIG.colors.loveRose}`, 
-              color: CONFIG.colors.loveRose, 
-              fontFamily: 'serif', 
-              fontSize: isMobile ? '11px' : '14px', 
-              fontWeight: 'bold', 
-              letterSpacing: isMobile ? '2px' : '3px', 
-              textTransform: 'uppercase', 
-              cursor: 'pointer', 
-              touchAction: 'manipulation',
-              WebkitTapHighlightColor: 'transparent',
-              backdropFilter: 'blur(8px)', 
-              boxShadow: `0 0 15px ${CONFIG.colors.loveRose}40`, 
-              transition: 'all 0.3s' 
-            }}
-          >
-             {sceneState === 'CHAOS' ? '✨ Assemble Magic ✨' : '🌟 Disperse Stars 🌟'}
-          </button>
-        </div>
+        <button 
+          onClick={() => setDebugMode(!debugMode)} 
+          style={{ 
+            padding: isMobile ? '10px 12px' : '12px 15px', 
+            backgroundColor: debugMode ? CONFIG.colors.fireworksBlue : 'rgba(10, 10, 26, 0.8)', 
+            border: `2px solid ${CONFIG.colors.fireworksBlue}`, 
+            color: debugMode ? '#000' : CONFIG.colors.fireworksBlue, 
+            fontFamily: 'sans-serif', 
+            fontSize: isMobile ? '10px' : '12px', 
+            fontWeight: 'bold', 
+            cursor: 'pointer', 
+            touchAction: 'manipulation',
+            WebkitTapHighlightColor: 'transparent',
+            backdropFilter: 'blur(8px)', 
+            boxShadow: debugMode ? `0 0 15px ${CONFIG.colors.fireworksBlue}` : 'none', 
+            transition: 'all 0.3s' 
+          }}
+        >
+           {debugMode ? 'HIDE VISUALIZE' : '👁️ VISUALIZE'}
+        </button>
       </div>
 
       {/* UI - AI Status - Mobile Responsive */}
@@ -1449,24 +2017,49 @@ export default function GrandTreeApp() {
       </div>
 
       {/* UI - Title - Mobile Responsive */}
-      <div style={{ 
-        position: 'absolute', 
-        top: isMobile ? '40px' : '50px', 
-        left: '50%', 
-        transform: 'translateX(-50%)', 
-        color: CONFIG.colors.loveRose, 
-        fontSize: isMobile ? '14px' : '22px',
-        letterSpacing: isMobile ? '2px' : '5px',
-        zIndex: 10, 
-        fontFamily: 'serif', 
-        fontWeight: 'bold', 
-        textShadow: `0 0 20px ${CONFIG.colors.loveRose}, 0 0 40px ${CONFIG.colors.lovePink}, 0 0 60px ${CONFIG.colors.accent}`, 
-        textAlign: 'center',
-        padding: isMobile ? '0 10px' : '0',
-        maxWidth: isMobile ? '90%' : 'auto'
-      }}>
-        🎆 FROM 22 TO 25 & STILL COUNTING 🎆
-      </div>
+      {!showILoveYou && (
+        <div style={{ 
+          position: 'absolute', 
+          top: isMobile ? '40px' : '50px', 
+          left: '50%', 
+          transform: 'translateX(-50%)', 
+          color: CONFIG.colors.loveRose, 
+          fontSize: isMobile ? '14px' : '22px',
+          letterSpacing: isMobile ? '2px' : '5px',
+          zIndex: 10, 
+          fontFamily: 'serif', 
+          fontWeight: 'bold', 
+          textShadow: `0 0 20px ${CONFIG.colors.loveRose}, 0 0 40px ${CONFIG.colors.lovePink}, 0 0 60px ${CONFIG.colors.accent}`, 
+          textAlign: 'center',
+          padding: isMobile ? '0 10px' : '0',
+          maxWidth: isMobile ? '90%' : 'auto',
+          transition: 'opacity 0.5s ease-in-out'
+        }}>
+          🎆 FROM 22 TO 25 & STILL COUNTING 🎆
+        </div>
+      )}
+
+      {/* UI - I LOVE YOU Display - Mobile Responsive */}
+      {showILoveYou && (
+        <div className="iloveyou-text" style={{ 
+          position: 'absolute', 
+          top: '50%', 
+          left: '50%', 
+          transform: 'translate(-50%, -50%)', 
+          color: CONFIG.colors.loveRose, 
+          fontSize: isMobile ? '32px' : '56px',
+          letterSpacing: isMobile ? '4px' : '8px',
+          zIndex: 20, 
+          fontFamily: 'serif', 
+          fontWeight: 'bold', 
+          textShadow: `0 0 30px ${CONFIG.colors.loveRose}, 0 0 60px ${CONFIG.colors.lovePink}, 0 0 90px ${CONFIG.colors.accent}, 0 0 120px ${CONFIG.colors.loveRose}`, 
+          textAlign: 'center',
+          padding: isMobile ? '20px' : '40px',
+          transition: 'opacity 0.5s ease-in-out'
+        }}>
+          💕 I LOVE YOU 💕
+        </div>
+      )}
 
       
       {/* UI - Gesture Guide - Hidden by default, can be toggled */}
@@ -1478,6 +2071,7 @@ export default function GrandTreeApp() {
           </div>
           <p style={{ margin: '5px 0', color: CONFIG.colors.lovePink }}>🖐 Open Palm → Disperse</p>
           <p style={{ margin: '5px 0', color: CONFIG.colors.lovePink }}>✊ Fist → Assemble</p>
+          <p style={{ margin: '5px 0', color: CONFIG.colors.accent }}>👆 Point (Index Finger) → Transform to Galaxy ✨</p>
           <p style={{ margin: '5px 0', color: CONFIG.colors.fireworksBlue }}>👋 Hand Left/Right → Rotate</p>
           <p style={{ margin: '5px 0', color: CONFIG.colors.loveRose }}>🤏 Hands Closer → Zoom In</p>
           <p style={{ margin: '5px 0', color: CONFIG.colors.loveRose }}>🤏 Hands Farther → Zoom Out</p>
